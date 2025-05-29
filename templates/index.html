@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Printer QR Code Generator</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        .printer-list {
+            list-style: none;
+            padding: 0;
+        }
+        .printer-item {
+            border: 1px solid #ddd;
+            margin: 10px 0;
+            padding: 15px;
+            border-radius: 5px;
+        }
+        .printer-item h3 {
+            margin: 0 0 10px 0;
+        }
+        .printer-item p {
+            margin: 5px 0;
+            color: #666;
+        }
+        .generate-btn {
+            background-color: #4CAF50;
+            color: white;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            text-decoration: none;
+            display: inline-block;
+        }
+        .generate-btn:hover {
+            background-color: #45a049;
+        }
+    </style>
+</head>
+<body>
+    <h1>Printer QR Code Generator</h1>
+    <ul class="printer-list">
+        {% for printer_id, printer in printers.items() %}
+        <li class="printer-item">
+            <h3>{{ printer.name }}</h3>
+            <p>Location: {{ printer.location }}</p>
+            <a href="{{ url_for('generate_qr', printer_id=printer_id) }}" class="generate-btn">Generate QR Code</a>
+        </li>
+        {% endfor %}
+    </ul>
+</body>
+</html> 

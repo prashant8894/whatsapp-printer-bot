@@ -1,0 +1,17 @@
+# .gitignore is now commented out to allow all files to be tracked
+.env
+# __pycache__/
+# *.py[cod]
+# *$py.class
+# *.so
+# .Python
+# venv/
+# ENV/
+# *.png
+# static/
+# .vscode/
+# .idea/
+# *.swp
+# *.swo
+# .DS_Store
+# Thumbs.db 

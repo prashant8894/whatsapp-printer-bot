@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Enter Phone Number</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            text-align: center;
+        }
+        .phone-form {
+            margin: 20px auto;
+            padding: 20px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            max-width: 400px;
+        }
+        .phone-input {
+            width: 100%;
+            padding: 10px;
+            margin: 10px 0;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            box-sizing: border-box;
+        }
+        .submit-btn {
+            background-color: #4CAF50;
+            color: white;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            width: 100%;
+        }
+        .submit-btn:hover {
+            background-color: #45a049;
+        }
+        .note {
+            color: #666;
+            font-size: 0.9em;
+            margin: 10px 0;
+        }
+    </style>
+</head>
+<body>
+    <h1>Enter Your Phone Number</h1>
+    <div class="phone-form">
+        <p class="note">Please enter your phone number to receive the printer notification.</p>
+        <form action="{{ url_for('scan', printer_id=printer_id) }}" method="GET">
+            <input type="tel" name="phone" class="phone-input" placeholder="Enter your phone number" required>
+            <button type="submit" class="submit-btn">Send Message</button>
+        </form>
+    </div>
+</body>
+</html> 

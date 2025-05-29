@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Printer QR Code</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            text-align: center;
+        }
+        .qr-container {
+            margin: 20px auto;
+            padding: 20px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            display: inline-block;
+        }
+        .qr-code {
+            max-width: 300px;
+            margin: 20px auto;
+        }
+        .printer-info {
+            margin: 20px 0;
+            color: #666;
+        }
+        .download-btn {
+            background-color: #4CAF50;
+            color: white;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            text-decoration: none;
+            display: inline-block;
+            margin: 10px;
+        }
+        .download-btn:hover {
+            background-color: #45a049;
+        }
+    </style>
+</head>
+<body>
+    <h1>Printer QR Code</h1>
+    <div class="printer-info">
+        <h2>{{ printer.name }}</h2>
+        <p>Location: {{ printer.location }}</p>
+    </div>
+    <div class="qr-container">
+        <img src="{{ url_for('static', filename=qr_path) }}" alt="Printer QR Code" class="qr-code">
+    </div>
+    <div>
+        <a href="{{ url_for('static', filename=qr_path) }}" download class="download-btn">Download QR Code</a>
+        <a href="{{ url_for('home') }}" class="download-btn" style="background-color: #666;">Back to Printers</a>
+    </div>
+</body>
+</html> 
