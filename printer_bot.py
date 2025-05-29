@@ -5,16 +5,7 @@ import os
 from dotenv import load_dotenv
 import requests
 import json
-import logging
-from twilio.base.exceptions import TwilioRestException
-
-# Configure logging
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-logger = logging.getLogger(__name__)
+import qrcode
 
 # Load environment variables
 load_dotenv()
@@ -31,7 +22,6 @@ HUGGINGFACE_API_KEY = os.getenv('HUGGINGFACE_API_KEY')
 client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 # Printer settings
-PRINTER_IP = "192.168.1.100"  # Replace with your printer's IP address
 PRINTER_SETTINGS = {
     'color_mode': False,
     'copies': 1,
@@ -42,9 +32,60 @@ PRINTER_SETTINGS = {
 def analyze_command_with_huggingface(command):
     """Analyze user command using HuggingFace Inference API"""
     try:
-        prompt = f"""Convert this printer command into a JSON object with specific fields.\n\nInput command: {command}\n\nRequired JSON format:\n{{\n    \"action\": \"print|scan|copy|status\",\n    \"color_mode\": true|false,\n    \"copies\": number,\n    \"paper_size\": \"A4\",\n    \"orientation\": \"portrait\"\n}}\n\nRules:\n1. For action, use only: \"print\", \"scan\", \"copy\", or \"status\"\n2. For color_mode, use only: true or false\n3. For copies, use a number\n4. For paper_size, use \"A4\"\n5. For orientation, use \"portrait\"\n\nReturn ONLY the JSON object, nothing else."""
-        logger.debug("\n=== HuggingFace API Request ===")
-        logger.debug(f"Command to analyze: {command}")
+        # Simple command parsing for common cases
+        command = command.lower().strip()
+        
+        # Default settings
+        settings = {
+            "action": "print",
+            "color_mode": False,
+            "copies": 1,
+            "paper_size": "A4",
+            "orientation": "portrait"
+        }
+        
+        # Handle common commands directly
+        if "scan" in command:
+            settings["action"] = "scan"
+            return settings
+        elif "status" in command:
+            settings["action"] = "status"
+            return settings
+        elif "copy" in command or "copies" in command:
+            settings["action"] = "copy"
+            # Try to extract number of copies
+            import re
+            copies_match = re.search(r'(\d+)\s*cop(?:y|ies)', command)
+            if copies_match:
+                settings["copies"] = int(copies_match.group(1))
+            return settings
+        elif "print" in command:
+            settings["action"] = "print"
+            if "color" in command:
+                settings["color_mode"] = True
+            return settings
+            
+        # If no direct match, use HuggingFace for complex commands
+        prompt = f"""Analyze this printer command and return a JSON object with these exact fields:
+{{
+    "action": "print",
+    "color_mode": false,
+    "copies": 1,
+    "paper_size": "A4",
+    "orientation": "portrait"
+}}
+
+Command: {command}
+
+Rules:
+- action must be one of: "print", "scan", "copy", "status"
+- color_mode must be true or false
+- copies must be a number
+- paper_size must be "A4"
+- orientation must be "portrait"
+
+Return ONLY the JSON object, nothing else."""
+
         API_URL = "https://api-inference.huggingface.co/models/HuggingFaceH4/zephyr-7b-beta"
         headers = {
             "Authorization": f"Bearer {HUGGINGFACE_API_KEY}",
@@ -54,39 +95,27 @@ def analyze_command_with_huggingface(command):
             headers=headers,
             json={"inputs": prompt, "parameters": {"max_new_tokens": 150, "temperature": 0.1, "do_sample": False}}
         )
-        logger.debug("\n=== HuggingFace API Response ===")
-        logger.debug(f"Status Code: {response.status_code}")
-        logger.debug(f"Raw Response: {response.text}")
+        
         if response.status_code == 200:
             result = response.json()
             try:
                 response_text = result[0]['generated_text'] if isinstance(result, list) else result.get('generated_text', '')
-                logger.debug(f"\nGenerated Text: {response_text}")
-                response_text = response_text.strip()
+                # Extract JSON from response
                 start_idx = response_text.find('{')
                 end_idx = response_text.rfind('}') + 1
                 if start_idx != -1 and end_idx != -1:
                     json_str = response_text[start_idx:end_idx]
-                    logger.debug(f"\nExtracted JSON: {json_str}")
                     parsed_json = json.loads(json_str)
+                    # Validate required fields
                     required_fields = ['action', 'color_mode', 'copies', 'paper_size', 'orientation']
                     if all(field in parsed_json for field in required_fields):
-                        logger.debug(f"\nParsed Settings: {parsed_json}")
                         return parsed_json
-                    else:
-                        logger.warning("\nMissing required fields in JSON")
-                        return None
-                else:
-                    logger.warning("\nNo JSON object found in response")
-                    return None
             except Exception as e:
-                logger.error(f"\nError parsing JSON: {e}")
+                print(f"Error parsing JSON: {e}")
                 return None
-        else:
-            logger.error(f"\nAPI request failed with status {response.status_code}")
-            return None
+        return None
     except Exception as e:
-        logger.error(f"\nError analyzing command: {e}")
+        print(f"Error analyzing command: {e}")
         return None
 
 def format_settings_message(settings):
@@ -100,73 +129,12 @@ def format_settings_message(settings):
     message += "Is this correct? Reply with 'yes' to confirm or 'no' to cancel."
     return message
 
-def send_whatsapp_message(to_number, message_body, media_url=None):
-    """Send WhatsApp message with proper error handling"""
-    try:
-        logger.debug("\n=== Sending WhatsApp Message ===")
-        logger.debug(f"To: {to_number}")
-        logger.debug(f"From: whatsapp:{TWILIO_PHONE_NUMBER}")
-        logger.debug(f"Body: {message_body}")
-        if media_url:
-            logger.debug(f"Media URL: {media_url}")
-        
-        message_params = {
-            'from_': f'whatsapp:{TWILIO_PHONE_NUMBER}',
-            'body': message_body,
-            'to': to_number
-        }
-        
-        if media_url:
-            message_params['media_url'] = [media_url]
-        
-        message = client.messages.create(**message_params)
-        
-        logger.debug("\n=== Twilio Response ===")
-        logger.debug(f"Message SID: {message.sid}")
-        logger.debug(f"Status: {message.status}")
-        logger.debug(f"Error Code: {message.error_code}")
-        logger.debug(f"Error Message: {message.error_message}")
-        
-        return message
-        
-    except TwilioRestException as e:
-        logger.error("\n=== Twilio API Error ===")
-        logger.error(f"Error Code: {e.code}")
-        logger.error(f"Error Message: {e.msg}")
-        logger.error(f"More Info: {e.more_info}")
-        
-        # Handle specific Twilio errors
-        if e.code == 21211:  # Invalid phone number
-            return send_whatsapp_message(to_number, "Sorry, there was an issue with the phone number. Please try again.")
-        elif e.code == 21608:  # Rate limit exceeded
-            return send_whatsapp_message(to_number, "Sorry, we're experiencing high traffic. Please try again in a few minutes.")
-        elif e.code == 21614:  # Account suspended
-            return send_whatsapp_message(to_number, "Sorry, our service is temporarily unavailable. Please try again later.")
-        else:
-            return send_whatsapp_message(to_number, "Sorry, there was an error sending the message. Please try again.")
-            
-    except Exception as e:
-        logger.error("\n=== Unexpected Error ===")
-        logger.error(f"Error Type: {type(e).__name__}")
-        logger.error(f"Error Message: {str(e)}")
-        return send_whatsapp_message(to_number, "Sorry, an unexpected error occurred. Please try again.")
-
 def handle_printer_command(settings, user_number):
     """Handle printer commands with settings"""
     if settings['action'] == 'print':
         return "✅ Print job completed successfully! Your document has been printed."
     elif settings['action'] == 'scan':
-        # Simulate scanning and getting a PDF URL
-        # In a real implementation, this would be the URL of your scanned document
-        scanned_doc_url = "https://example.com/scanned_document.pdf"  # Replace with actual scanned document URL
-        
-        # Send the scanned document
-        message = send_whatsapp_message(
-            user_number,
-            "✅ Document scanned successfully! Here's your scanned document:",
-            media_url=scanned_doc_url
-        )
-        return "✅ Document scanned and sent to your WhatsApp!"
+        return "✅ Document scanned successfully! The scanned file has been sent to your WhatsApp."
     elif settings['action'] == 'copy':
         return "✅ Copy job completed successfully! Your copies are ready for pickup."
     elif settings['action'] == 'status':
@@ -183,111 +151,87 @@ def home():
 def webhook():
     """Handle incoming WhatsApp messages"""
     try:
-        # Get message type and content
-        message_type = request.values.get('MediaContentType0', '')
+        # Log incoming request
+        print("\n=== Incoming Webhook Request ===")
+        print(f"From: {request.values.get('From', 'Unknown')}")
+        print(f"To: {request.values.get('To', 'Unknown')}")
+        print(f"Message SID: {request.values.get('MessageSid', 'Unknown')}")
+        
         incoming_msg = request.values.get('Body', '').lower()
-        media_url = request.values.get('MediaUrl0', '')
-        num_media = request.values.get('NumMedia', '0')
+        print(f"Message Body: {incoming_msg}")
         
-        logger.info("\n=== Incoming Message Details ===")
-        logger.info(f"From: {request.values.get('From', '')}")
-        logger.info(f"Message Type: {message_type}")
-        logger.info(f"Number of Media Files: {num_media}")
-        logger.info(f"Message Body: {incoming_msg}")
-        logger.info(f"Media URL: {media_url}")
-        
-        # Log all request values for debugging
-        logger.debug("\n=== All Request Values ===")
-        for key, value in request.values.items():
-            logger.debug(f"{key}: {value}")
-        
-        # Handle media messages (documents, images, etc.)
-        if message_type:
-            logger.info("\n=== Processing Media Message ===")
-            if 'application/' in message_type:
-                logger.info(f"Document Type: {message_type}")
-                if not incoming_msg:  # If no message with the document
-                    incoming_msg = "print this document"
-                    logger.info("No message provided with document, defaulting to 'print this document'")
-                else:
-                    incoming_msg = f"{incoming_msg} this document"
-                    logger.info(f"Combined message with document: {incoming_msg}")
-            elif 'image/' in message_type:
-                logger.info(f"Image Type: {message_type}")
-                if not incoming_msg:  # If no message with the image
-                    incoming_msg = "print this image"
-                    logger.info("No message provided with image, defaulting to 'print this image'")
-                else:
-                    incoming_msg = f"{incoming_msg} this image"
-                    logger.info(f"Combined message with image: {incoming_msg}")
-            else:
-                logger.info(f"Other Media Type: {message_type}")
-                if not incoming_msg:  # If no message with the media
-                    incoming_msg = "print this file"
-                    logger.info("No message provided with media, defaulting to 'print this file'")
-                else:
-                    incoming_msg = f"{incoming_msg} this file"
-                    logger.info(f"Combined message with media: {incoming_msg}")
-        
-        # Handle basic commands directly
-        if incoming_msg == 'hi' or incoming_msg == 'hello':
-            welcome_msg = "👋 How can I help you today?\n\n"
-            welcome_msg += "Here are some examples of what you can do:\n\n"
-            welcome_msg += "• Print a document in color with 2 copies\n"
-            welcome_msg += "• Scan this document and send it to WhatsApp\n"
-            welcome_msg += "• Make 3 copies of this document\n"
-            welcome_msg += "• Check printer status\n\n"
-            welcome_msg += "Just tell me what you need in your own words!"
+        # Handle initial greeting
+        if incoming_msg == 'hi':
+            welcome_message = "👋 Hi! I'm your Printer Bot. Here are the commands you can use:\n\n" + \
+                            "• 'print [in color/black & white]' - Print a document\n" + \
+                            "• 'scan' - Scan a document\n" + \
+                            "• 'make X copies' - Make X copies of a document\n" + \
+                            "• 'status' - Check printer status\n\n" + \
+                            "Just type any of these commands and I'll help you!"
+            print("\n=== Sending Welcome Message ===")
+            print(f"Message: {welcome_message}")
             
-            message = send_whatsapp_message(request.values.get('From', ''), welcome_msg)
             resp = MessagingResponse()
-            resp.message(welcome_msg)
+            resp.message(welcome_message)
             return str(resp)
             
-        # For other commands, use the LLM
         settings = analyze_command_with_huggingface(incoming_msg)
         if settings:
+            print("\n=== Command Analysis Results ===")
+            print(f"Settings: {json.dumps(settings, indent=2)}")
+            
             response_msg = f"✅ I'll help you with that!\n\n" + \
                          f"Action: {settings['action']}\n" + \
                          f"Color Mode: {'Color' if settings['color_mode'] else 'Black & White'}\n" + \
                          f"Copies: {settings['copies']}\n" + \
                          f"Paper Size: {settings['paper_size']}\n" + \
                          f"Orientation: {settings['orientation']}\n\n" + \
-                         f"Processing your request..."
+                         f"Please scan the QR code to connect to the printer."
             
-            # Send the response message
-            message = send_whatsapp_message(request.values.get('From', ''), response_msg)
+            print("\n=== Generating QR Code ===")
+            qr = qrcode.QRCode(version=1, box_size=10, border=5)
+            qr.add_data("https://printer-connect.example.com")
+            qr.make(fit=True)
+            qr_img = qr.make_image(fill_color="black", back_color="white")
+            qr_path = "printer_qr.png"
+            qr_img.save(qr_path)
+            print(f"QR Code saved to: {qr_path}")
             
-            # Process the printer command
-            result = handle_printer_command(settings, request.values.get('From', ''))
-            
-            # Send the result message
-            message = send_whatsapp_message(request.values.get('From', ''), result)
-            
-            resp = MessagingResponse()
-            resp.message(result)
-            return str(resp)
+            print("\n=== Sending Twilio Message ===")
+            try:
+                message = client.messages.create(
+                    from_=f'whatsapp:{os.getenv("TWILIO_PHONE_NUMBER")}',
+                    body=response_msg,
+                    to=request.values.get('From', ''),
+                    media_url=[f"https://{request.host}/static/{qr_path}"]
+                )
+                print(f"Message SID: {message.sid}")
+                print(f"Message Status: {message.status}")
+                
+                resp = MessagingResponse()
+                resp.message(response_msg)
+                return str(resp)
+            except Exception as twilio_error:
+                print(f"\n=== Twilio Error ===")
+                print(f"Error Type: {type(twilio_error).__name__}")
+                print(f"Error Message: {str(twilio_error)}")
+                error_msg = "Sorry, there was an error sending the message. Please try again later."
+                resp = MessagingResponse()
+                resp.message(error_msg)
+                return str(resp)
         else:
-            error_msg = "I'm not sure I understand. Try saying something like 'make 3 copies' or 'print in color'"
-            message = send_whatsapp_message(request.values.get('From', ''), error_msg)
-            
+            print("\n=== Command Not Understood ===")
+            print(f"Original message: {incoming_msg}")
             resp = MessagingResponse()
-            resp.message(error_msg)
+            resp.message("I'm not sure I understand. Try saying something like 'make 3 copies' or 'print in color'")
             return str(resp)
-            
     except Exception as e:
-        logger.error("\n=== Webhook Error ===")
-        logger.error(f"Error Type: {type(e).__name__}")
-        logger.error(f"Error Message: {str(e)}")
-        
-        error_msg = "Sorry, something went wrong. Please try again."
-        try:
-            message = send_whatsapp_message(request.values.get('From', ''), error_msg)
-        except:
-            pass  # If we can't send the error message, at least return a response
-        
+        print(f"\n=== Critical Error in Webhook ===")
+        print(f"Error Type: {type(e).__name__}")
+        print(f"Error Message: {str(e)}")
+        print(f"Request Values: {dict(request.values)}")
         resp = MessagingResponse()
-        resp.message(error_msg)
+        resp.message("Sorry, something went wrong. Please try again.")
         return str(resp)
 
 @app.route('/send-initial', methods=['POST'])
