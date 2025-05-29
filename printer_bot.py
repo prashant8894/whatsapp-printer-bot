@@ -6,6 +6,11 @@ from dotenv import load_dotenv
 import requests
 import json
 import qrcode
+import tempfile
+from pathlib import Path
+from datetime import datetime
+import mimetypes
+import shutil
 
 # Load environment variables
 load_dotenv()
@@ -20,6 +25,10 @@ HUGGINGFACE_API_KEY = os.getenv('HUGGINGFACE_API_KEY')
 
 # Initialize Twilio client
 client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+# Create media directory if it doesn't exist
+MEDIA_DIR = Path("media")
+MEDIA_DIR.mkdir(exist_ok=True)
 
 # Printer settings
 PRINTER_SETTINGS = {
@@ -142,6 +151,137 @@ def handle_printer_command(settings, user_number):
     else:
         return "❌ Invalid command. Please try again."
 
+def download_media(media_url, media_type):
+    """Download media from Twilio URL and save to local storage"""
+    try:
+        print(f"\n=== Downloading Media ===")
+        print(f"URL: {media_url}")
+        print(f"Type: {media_type}")
+        
+        # Create a temporary file
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=f".{media_type.split('/')[-1]}")
+        temp_path = temp_file.name
+        
+        # Download the file with Twilio authentication
+        response = requests.get(
+            media_url,
+            stream=True,
+            auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        )
+        
+        if response.status_code == 200:
+            with open(temp_path, 'wb') as f:
+                response.raw.decode_content = True
+                shutil.copyfileobj(response.raw, f)
+            
+            # Generate a unique filename
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"{timestamp}_{Path(temp_path).name}"
+            final_path = MEDIA_DIR / filename
+            
+            # Move to media directory
+            shutil.move(temp_path, final_path)
+            print(f"Media saved to: {final_path}")
+            return str(final_path)
+        else:
+            print(f"Failed to download media. Status code: {response.status_code}")
+            print(f"Response content: {response.text}")
+            return None
+    except Exception as e:
+        print(f"Error downloading media: {e}")
+        return None
+
+def mock_print_document(file_path, settings):
+    """Mock function to simulate printing a document"""
+    try:
+        print(f"\n=== Mock Printing Document ===")
+        print(f"File: {file_path}")
+        print(f"Settings: {json.dumps(settings, indent=2)}")
+        
+        # Simulate printing delay
+        import time
+        time.sleep(2)
+        
+        return True
+    except Exception as e:
+        print(f"Error in mock printing: {e}")
+        return False
+
+def mock_scan_document(file_path):
+    """Mock function to simulate scanning a document"""
+    try:
+        print(f"\n=== Mock Scanning Document ===")
+        print(f"File: {file_path}")
+        
+        # Simulate scanning delay
+        import time
+        time.sleep(2)
+        
+        # Return a mock scanned file path
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        scanned_path = MEDIA_DIR / f"scanned_{timestamp}.pdf"
+        return str(scanned_path)
+    except Exception as e:
+        print(f"Error in mock scanning: {e}")
+        return None
+
+def handle_media_message(request_values):
+    """Handle incoming media messages"""
+    try:
+        print("\n=== Processing Media Message ===")
+        
+        # Get media information
+        media_url = request_values.get('MediaUrl0')
+        media_type = request_values.get('MediaContentType0')
+        num_media = int(request_values.get('NumMedia', 0))
+        
+        if not media_url or not media_type or num_media == 0:
+            print("No media found in message")
+            return None, "No media found in the message. Please send a document or image."
+        
+        print(f"Media Type: {media_type}")
+        print(f"Media URL: {media_url}")
+        
+        # Download the media
+        file_path = download_media(media_url, media_type)
+        if not file_path:
+            return None, "Failed to download the media. Please try again."
+        
+        # Get the last command from the user
+        last_command = request_values.get('Body', '').lower()
+        settings = analyze_command_with_huggingface(last_command) if last_command else None
+        
+        if not settings:
+            settings = {
+                "action": "print",
+                "color_mode": False,
+                "copies": 1,
+                "paper_size": "A4",
+                "orientation": "portrait"
+            }
+        
+        # Process based on command
+        if settings["action"] == "print":
+            success = mock_print_document(file_path, settings)
+            if success:
+                return True, "✅ Document printed successfully!"
+            else:
+                return False, "❌ Failed to print document. Please try again."
+        
+        elif settings["action"] == "scan":
+            scanned_path = mock_scan_document(file_path)
+            if scanned_path:
+                return True, f"✅ Document scanned successfully! Saved as: {Path(scanned_path).name}"
+            else:
+                return False, "❌ Failed to scan document. Please try again."
+        
+        else:
+            return False, "❌ Invalid command for media. Please specify 'print' or 'scan'."
+            
+    except Exception as e:
+        print(f"Error handling media message: {e}")
+        return False, "❌ An error occurred while processing the media. Please try again."
+
 @app.route('/')
 def home():
     """Root route to confirm server is running"""
@@ -156,6 +296,14 @@ def webhook():
         print(f"From: {request.values.get('From', 'Unknown')}")
         print(f"To: {request.values.get('To', 'Unknown')}")
         print(f"Message SID: {request.values.get('MessageSid', 'Unknown')}")
+        
+        # Check if message contains media
+        num_media = int(request.values.get('NumMedia', 0))
+        if num_media > 0:
+            success, response_msg = handle_media_message(request.values)
+            resp = MessagingResponse()
+            resp.message(response_msg)
+            return str(resp)
         
         incoming_msg = request.values.get('Body', '').lower()
         print(f"Message Body: {incoming_msg}")
