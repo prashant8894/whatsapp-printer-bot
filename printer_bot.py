@@ -1,4 +1,4 @@
-from flask import Flask, request, Response
+from flask import Flask, request, Response, send_from_directory
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client
 import os
@@ -233,7 +233,7 @@ def handle_media_message(request_values):
         # Get media information
         media_url = request_values.get('MediaUrl0')
         media_type = request_values.get('MediaContentType0')
-        num_media = int(request_values.get('NumMedia', 0))
+        num_media = int(request.values.get('NumMedia', 0))
         
         if not media_url or not media_type or num_media == 0:
             print("No media found in message")
@@ -260,18 +260,27 @@ def handle_media_message(request_values):
                 "orientation": "portrait"
             }
         
+        # Create response
+        resp = MessagingResponse()
+        
         # Process based on command
         if settings["action"] == "print":
             success = mock_print_document(file_path, settings)
             if success:
-                return True, "✅ Document printed successfully!"
+                # Add the downloaded media to the response
+                media_url = f"https://{request.host}/media/{Path(file_path).name}"
+                resp.message("✅ Document downloaded and printed successfully!").media(media_url)
+                return True, resp
             else:
                 return False, "❌ Failed to print document. Please try again."
         
         elif settings["action"] == "scan":
             scanned_path = mock_scan_document(file_path)
             if scanned_path:
-                return True, f"✅ Document scanned successfully! Saved as: {Path(scanned_path).name}"
+                # Add the scanned media to the response
+                media_url = f"https://{request.host}/media/{Path(scanned_path).name}"
+                resp.message(f"✅ Document scanned successfully! Saved as: {Path(scanned_path).name}").media(media_url)
+                return True, resp
             else:
                 return False, "❌ Failed to scan document. Please try again."
         
@@ -287,6 +296,15 @@ def home():
     """Root route to confirm server is running"""
     return "Printer Bot is running! Use /webhook for WhatsApp messages."
 
+@app.route('/media/<filename>')
+def serve_media(filename):
+    """Serve media files from the media directory"""
+    try:
+        return send_from_directory(MEDIA_DIR, filename)
+    except Exception as e:
+        print(f"Error serving media file {filename}: {e}")
+        return "File not found", 404
+
 @app.route('/webhook', methods=['POST'])
 def webhook():
     """Handle incoming WhatsApp messages"""
@@ -300,10 +318,12 @@ def webhook():
         # Check if message contains media
         num_media = int(request.values.get('NumMedia', 0))
         if num_media > 0:
-            success, response_msg = handle_media_message(request.values)
-            resp = MessagingResponse()
-            resp.message(response_msg)
-            return str(resp)
+            success, response = handle_media_message(request.values)
+            if isinstance(response, str):
+                resp = MessagingResponse()
+                resp.message(response)
+                return str(resp)
+            return str(response)
         
         incoming_msg = request.values.get('Body', '').lower()
         print(f"Message Body: {incoming_msg}")
