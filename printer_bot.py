@@ -11,9 +11,26 @@ from pathlib import Path
 from datetime import datetime
 import mimetypes
 import shutil
+import cups
+import logging
+from logging.handlers import RotatingFileHandler
+import argparse
+import socket
+import time
+import subprocess
 
 # Load environment variables
 load_dotenv()
+
+# Configure logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+
+# Add file handler for persistent logging
+log_file = 'printer_bot.log'
+file_handler = RotatingFileHandler(log_file, maxBytes=1024*1024, backupCount=5)
+file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+logger.addHandler(file_handler)
 
 app = Flask(__name__)
 
@@ -23,6 +40,10 @@ TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN')
 TWILIO_PHONE_NUMBER = os.getenv('TWILIO_PHONE_NUMBER')
 HUGGINGFACE_API_KEY = os.getenv('HUGGINGFACE_API_KEY')
 
+# Printer settings
+PRINTER_IP = "192.168.203.10"
+PRINTER_NAME = f"HP_LaserJet_{PRINTER_IP.replace('.', '_')}"
+
 # Initialize Twilio client
 client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
@@ -30,13 +51,135 @@ client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 MEDIA_DIR = Path("media")
 MEDIA_DIR.mkdir(exist_ok=True)
 
-# Printer settings
-PRINTER_SETTINGS = {
-    'color_mode': False,
-    'copies': 1,
-    'paper_size': 'A4',
-    'orientation': 'portrait'
-}
+def is_printer_reachable(ip, port=9100, timeout=5):
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            return True
+    except (socket.timeout, socket.error):
+        return False
+
+def install_printer_if_needed(printer_name, ip):
+    conn = cups.Connection()
+    if printer_name in conn.getPrinters():
+        logger.info(f"✅ Printer {printer_name} already installed.")
+        return
+    logger.info(f"🛠️ Installing printer {printer_name} using ipp://...")
+    uri = f"ipp://{ip}/ipp/print"
+    driver = "everywhere"
+    try:
+        subprocess.run([
+            "lpadmin", "-p", printer_name,
+            "-v", uri,
+            "-m", driver,
+            "-E"
+        ], check=True)
+        logger.info(f"✅ Printer {printer_name} installed.")
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"❌ Failed to install printer: {e}")
+
+def delete_printer(printer_name):
+    try:
+        subprocess.run(["lpadmin", "-x", printer_name], check=True)
+        logger.info(f"🧹 Removed printer {printer_name}")
+    except subprocess.CalledProcessError:
+        logger.warning(f"⚠️ Warning: Failed to delete printer {printer_name}")
+
+def wait_for_job_completion(conn, job_id, timeout=120, poll_interval=5):
+    logger.info(f"⏳ Waiting for job {job_id} to complete...")
+    waited = 0
+    while waited < timeout:
+        try:
+            job_attrs = conn.getJobAttributes(job_id)
+            job_state = job_attrs.get("job-state", None)
+            job_state_reasons = job_attrs.get("job-state-reasons", [])
+            state_name = {
+                3: "pending",
+                4: "pending-held",
+                5: "processing",
+                6: "processing-stopped",
+                7: "completed",
+                8: "canceled",
+                9: "aborted"
+            }.get(job_state, "unknown")
+
+            if job_state == 7:
+                logger.info(f"✅ Print job {job_id} completed successfully.")
+                return True
+            elif job_state in [8, 9]:
+                # Check if job is marked completed in job history
+                completed_jobs = conn.getJobs(which_jobs='completed', my_jobs=True)
+                if job_id in completed_jobs:
+                    logger.info(f"✅ Print job {job_id} is successfully completed.")
+                    return True
+                logger.error(f"❌ Print job {job_id} failed: {state_name}")
+                return False
+            else:
+                logger.info(f"📋 Job {job_id} state: {state_name} ({job_state_reasons})")
+        except cups.IPPError as e:
+            logger.warning(f"⚠️ Error fetching job attributes: {e}")
+            break
+
+        time.sleep(poll_interval)
+        waited += poll_interval
+
+    logger.warning(f"⚠️ Job {job_id} did not complete within {timeout} seconds.")
+    return False
+
+def print_document(file_path, settings):
+    """Print a document using CUPS with proper printer installation"""
+    try:
+        logger.info(f"Attempting to print document: {file_path}")
+        logger.info(f"Print settings: {settings}")
+        
+        # Check if printer is reachable
+        if not is_printer_reachable(PRINTER_IP):
+            error_msg = f"Cannot connect to printer at {PRINTER_IP}:9100"
+            logger.error(error_msg)
+            return False, error_msg
+        
+        # Install printer if needed
+        try:
+            install_printer_if_needed(PRINTER_NAME, PRINTER_IP)
+        except Exception as e:
+            error_msg = f"Failed to install printer: {e}"
+            logger.error(error_msg)
+            return False, error_msg
+        
+        # Prepare print options
+        print_options = {
+            "copies": str(settings['copies']),
+            "sides": "one-sided",
+            "orientation-requested": "3" if settings['orientation'] == 'portrait' else "4",
+            "print-color-mode": "color" if settings['color_mode'] else "monochrome",
+            "media": settings['paper_size']
+        }
+        
+        try:
+            conn = cups.Connection()
+            logger.info(f"📤 Sending print job to {PRINTER_NAME}...")
+            job_id = conn.printFile(PRINTER_NAME, file_path, "WhatsApp Print Job", print_options)
+            logger.info(f"📝 Job ID: {job_id}")
+            
+            # Wait for job completion
+            success = wait_for_job_completion(conn, job_id)
+            if success:
+                return True, f"Print job completed successfully. Job ID: {job_id}"
+            else:
+                return False, f"Print job failed or timed out. Job ID: {job_id}"
+                
+        except cups.IPPError as e:
+            error_msg = f"CUPS printing error: {e}"
+            logger.error(error_msg)
+            return False, error_msg
+            
+    except Exception as e:
+        error_msg = f"Error during printing: {e}"
+        logger.error(error_msg)
+        return False, error_msg
+    finally:
+        # Optionally cleanup the printer after printing
+        # delete_printer(PRINTER_NAME)
+        pass
 
 def analyze_command_with_huggingface(command):
     """Analyze user command using HuggingFace Inference API"""
@@ -228,7 +371,7 @@ def mock_scan_document(file_path):
 def handle_media_message(request_values):
     """Handle incoming media messages"""
     try:
-        print("\n=== Processing Media Message ===")
+        logger.info("=== Processing Media Message ===")
         
         # Get media information
         media_url = request_values.get('MediaUrl0')
@@ -236,11 +379,11 @@ def handle_media_message(request_values):
         num_media = int(request.values.get('NumMedia', 0))
         
         if not media_url or not media_type or num_media == 0:
-            print("No media found in message")
+            logger.warning("No media found in message")
             return None, "No media found in the message. Please send a document or image."
         
-        print(f"Media Type: {media_type}")
-        print(f"Media URL: {media_url}")
+        logger.info(f"Media Type: {media_type}")
+        logger.info(f"Media URL: {media_url}")
         
         # Download the media
         file_path = download_media(media_url, media_type)
@@ -265,14 +408,14 @@ def handle_media_message(request_values):
         
         # Process based on command
         if settings["action"] == "print":
-            success = mock_print_document(file_path, settings)
+            success, message = print_document(file_path, settings)
             if success:
                 # Add the downloaded media to the response
                 media_url = f"https://{request.host}/media/{Path(file_path).name}"
-                resp.message("✅ Document downloaded and printed successfully!").media(media_url)
+                resp.message(f"✅ {message}").media(media_url)
                 return True, resp
             else:
-                return False, "❌ Failed to print document. Please try again."
+                return False, f"❌ {message}"
         
         elif settings["action"] == "scan":
             scanned_path = mock_scan_document(file_path)
@@ -288,8 +431,9 @@ def handle_media_message(request_values):
             return False, "❌ Invalid command for media. Please specify 'print' or 'scan'."
             
     except Exception as e:
-        print(f"Error handling media message: {e}")
-        return False, "❌ An error occurred while processing the media. Please try again."
+        error_msg = f"Error handling media message: {e}"
+        logger.error(error_msg)
+        return False, f"❌ An error occurred while processing the media: {str(e)}"
 
 @app.route('/')
 def home():
