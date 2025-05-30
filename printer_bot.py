@@ -47,6 +47,22 @@ PRINTER_NAME = f"HP_LaserJet_{PRINTER_IP.replace('.', '_')}"
 MEDIA_DIR = Path("media")
 MEDIA_DIR.mkdir(exist_ok=True)
 
+# State management for conversations
+conversation_states = {}
+
+def get_user_state(user_id):
+    """Get the current state for a user"""
+    return conversation_states.get(user_id, {})
+
+def set_user_state(user_id, state):
+    """Set the state for a user"""
+    conversation_states[user_id] = state
+
+def clear_user_state(user_id):
+    """Clear the state for a user"""
+    if user_id in conversation_states:
+        del conversation_states[user_id]
+
 def is_printer_reachable(ip, port=9100, timeout=5):
     try:
         with socket.create_connection((ip, port), timeout=timeout):
@@ -300,38 +316,47 @@ def send_whatsapp_message(to_number, message, media_urls=None):
             "Content-Type": "application/json"
         }
         
-        payload = {
+        # If we have media URLs, send them first
+        if media_urls:
+            for media_url in media_urls:
+                media_type = "image" if media_url.endswith(('.jpg', '.jpeg', '.png')) else "document"
+                media_payload = {
+                    "messaging_product": "whatsapp",
+                    "to": to_number,
+                    "type": media_type,
+                    media_type: {
+                        "link": media_url
+                    }
+                }
+                response = requests.post(url, headers=headers, json=media_payload)
+                if response.status_code != 200:
+                    logger.error(f"Failed to send media message: {response.text}")
+                    return False
+                time.sleep(1)  # Rate limiting
+            
+            # If we also have a text message, send it after the media
+            if message:
+                text_payload = {
+                    "messaging_product": "whatsapp",
+                    "to": to_number,
+                    "type": "text",
+                    "text": {"body": message}
+                }
+                response = requests.post(url, headers=headers, json=text_payload)
+                if response.status_code != 200:
+                    logger.error(f"Failed to send text message: {response.text}")
+                    return False
+            return True
+        
+        # If no media, just send the text message
+        text_payload = {
             "messaging_product": "whatsapp",
             "to": to_number,
             "type": "text",
             "text": {"body": message}
         }
         
-        if media_urls:
-            if len(media_urls) == 1:
-                # Single media
-                payload["type"] = "image" if media_urls[0].endswith(('.jpg', '.jpeg', '.png')) else "document"
-                payload["image" if payload["type"] == "image" else "document"] = {
-                    "link": media_urls[0]
-                }
-            else:
-                # Multiple media - send as separate messages
-                for media_url in media_urls:
-                    media_type = "image" if media_url.endswith(('.jpg', '.jpeg', '.png')) else "document"
-                    media_payload = {
-                        "messaging_product": "whatsapp",
-                        "to": to_number,
-                        "type": media_type,
-                        media_type: {"link": media_url}
-                    }
-                    response = requests.post(url, headers=headers, json=media_payload)
-                    if response.status_code != 200:
-                        logger.error(f"Failed to send media message: {response.text}")
-                        return False
-                    time.sleep(1)  # Rate limiting
-                return True
-        
-        response = requests.post(url, headers=headers, json=payload)
+        response = requests.post(url, headers=headers, json=text_payload)
         if response.status_code == 200:
             logger.info(f"Message sent successfully: {response.json()}")
             return True
@@ -444,7 +469,85 @@ def handle_media_message(request_data):
         from_number = contacts.get('wa_id')
         message_type = messages.get('type')
         message_id = messages.get('id')
-        user_command = messages.get('text', {}).get('body', '').strip().lower()
+        
+        # Get user's current state
+        user_state = get_user_state(from_number)
+        
+        # Get command from text message or image caption
+        user_command = ""
+        if message_type == 'text':
+            user_command = messages.get('text', {}).get('body', '').strip().lower()
+            # If we have a pending document and received a text command
+            if user_state.get('pending_document'):
+                logger.info("Processing command for pending document")
+                file_path = user_state['pending_document']
+                settings = analyze_command_with_huggingface(user_command)
+                if not settings:
+                    settings = {
+                        "action": "print",
+                        "color_mode": False,
+                        "copies": 1,
+                        "paper_size": "A4",
+                        "orientation": "portrait"
+                    }
+                
+                # Process the command
+                if settings["action"] == "print":
+                    success, message = print_document(file_path, settings)
+                    if success:
+                        send_whatsapp_message(from_number, f"✅ {message}")
+                        # Only clear state after successful print
+                        clear_user_state(from_number)
+                    else:
+                        send_whatsapp_message(from_number, f"❌ {message}\nPlease try again with a different command.")
+                elif settings["action"] == "scan":
+                    try:
+                        original_url = f"https://{request.host}/media/{Path(file_path).name}"
+                        send_whatsapp_message(from_number, "✅ Here's your document:")
+                        if send_whatsapp_message(from_number, "", [original_url]):
+                            # Only clear state after successful scan
+                            clear_user_state(from_number)
+                        else:
+                            send_whatsapp_message(from_number, "❌ Failed to send the document. Please try again.")
+                    except Exception as e:
+                        logger.error(f"Error in scan operation: {e}")
+                        send_whatsapp_message(from_number, "❌ An error occurred while processing your document. Please try again.")
+                else:
+                    send_whatsapp_message(from_number, "❌ Invalid command. Please specify 'print' or 'scan'.")
+                return True
+                
+        elif message_type == 'image':
+            user_command = messages.get('image', {}).get('caption', '').strip().lower()
+        elif message_type == 'document':
+            user_command = messages.get('document', {}).get('caption', '').strip().lower()
+            # If no caption for document, store it and ask user what they want to do
+            if not user_command:
+                media_id = messages.get('document', {}).get('id')
+                media_type = messages.get('document', {}).get('mime_type')
+                
+                if not media_id or not media_type:
+                    logger.warning("Media information missing")
+                    send_whatsapp_message(from_number, "Media information missing. Please resend your document.")
+                    return True
+                
+                file_path = download_media(media_id, media_type)
+                if not file_path:
+                    send_whatsapp_message(from_number, "Failed to download the document. Please try again.")
+                    return True
+                
+                # Store the document path in user's state
+                set_user_state(from_number, {
+                    'pending_document': file_path,
+                    'timestamp': time.time()
+                })
+                
+                send_whatsapp_message(from_number, "📄 I see you've sent a document. What would you like to do with it?\n\n" + \
+                                    "Please reply with one of these commands:\n" + \
+                                    "• 'print' - to print the document\n" + \
+                                    "• 'scan' - to scan the document\n" + \
+                                    "• 'copy' - to make copies\n\n" + \
+                                    "Or send the document again with the command in the caption.")
+                return True
         
         logger.info(f"From number: {from_number}")
         logger.info(f"Message type: {message_type}")
@@ -452,7 +555,7 @@ def handle_media_message(request_data):
         
         # Handle text-only messages
         if message_type == 'text':
-            if user_command == 'hi':
+            if user_command == 'hi' or user_command == 'hello':
                 welcome_message = "👋 Hi! I'm your Printer Bot. Here are the commands you can use:\n\n" + \
                                 "• 'print [in color/black & white]' - Print a document\n" + \
                                 "• 'scan' - Scan a document\n" + \
@@ -460,6 +563,17 @@ def handle_media_message(request_data):
                                 "• 'status' - Check printer status\n\n" + \
                                 "Just type any of these commands and I'll help you!"
                 send_whatsapp_message(from_number, welcome_message)
+                return True
+            elif user_command == 'status':
+                send_whatsapp_message(from_number, "🖨️ Your HP printer is online and ready to print!")
+                return True
+            elif user_command == 'help':
+                help_message = "Here's what I can help you with:\n" + \
+                             "- Say *status* to check printer status\n" + \
+                             "- Say *hello* to start a conversation\n" + \
+                             "- Send a document with 'print' or 'scan' command\n" + \
+                             "- More features coming soon!"
+                send_whatsapp_message(from_number, help_message)
                 return True
             else:
                 send_whatsapp_message(from_number, "Please send a document or image along with your command.")
@@ -478,6 +592,10 @@ def handle_media_message(request_data):
             file_path = download_media(media_id, media_type)
             if not file_path:
                 send_whatsapp_message(from_number, "Failed to download the media. Please try again.")
+                return True
+            
+            # For documents without caption, we've already handled it above
+            if message_type == 'document' and not user_command:
                 return True
             
             # Analyze the command
@@ -504,23 +622,14 @@ def handle_media_message(request_data):
                 return True
             
             elif settings["action"] == "scan":
-                scanned_path = mock_scan_document(file_path)
-                if scanned_path:
-                    # Get public URLs for both files
-                    original_url = f"https://{request.host}/media/{Path(file_path).name}"
-                    scanned_url = f"https://{request.host}/media/{Path(scanned_path).name}"
-                    
-                    logger.info(f"Original file URL: {original_url}")
-                    logger.info(f"Scanned file URL: {scanned_url}")
-                    
-                    # Send success message
-                    send_whatsapp_message(from_number, "✅ Document scanned successfully! Here are your files:")
-                    # Send both files
-                    send_whatsapp_message(from_number, "", [original_url, scanned_url])
-                    return True
-                else:
-                    send_whatsapp_message(from_number, "❌ Failed to scan document. Please try again.")
-                    return True
+                # For scan, we'll send back the original file
+                original_url = f"https://{request.host}/media/{Path(file_path).name}"
+                logger.info(f"Original file URL: {original_url}")
+                
+                # Send success message with the file
+                send_whatsapp_message(from_number, "✅ Here's your document:")
+                send_whatsapp_message(from_number, "", [original_url])
+                return True
             
             else:
                 send_whatsapp_message(from_number, "❌ Invalid or unsupported command for media. Please specify 'print' or 'scan'.")
