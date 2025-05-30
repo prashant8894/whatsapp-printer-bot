@@ -1,6 +1,4 @@
 from flask import Flask, request, Response, send_from_directory
-from twilio.twiml.messaging_response import MessagingResponse
-from twilio.rest import Client
 import os
 from dotenv import load_dotenv
 import requests
@@ -34,18 +32,16 @@ logger.addHandler(file_handler)
 
 app = Flask(__name__)
 
-# Twilio credentials
-TWILIO_ACCOUNT_SID = os.getenv('TWILIO_ACCOUNT_SID')
-TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN')
-TWILIO_PHONE_NUMBER = os.getenv('TWILIO_PHONE_NUMBER')
+# WhatsApp Business API credentials
+WHATSAPP_PHONE_NUMBER_ID = "698272523378264"
+WHATSAPP_ACCESS_TOKEN = "EAAPNxI60DgMBOwP0kbu6No1ocIn6xIj66KauJaIZC2oToaXZAL7PalbFSPbZC5wNkLVWKCu5kjwiJZBVMce5IAQFRoQZBSqvddQTZAtWnzpCWJjuDCWuOmYqGjdZCTcdC4lEDZAr7fqgoVFlIZCpVewZAodtJtUHa9fu0WZC4KLVB3sXGIoZA7HXOvsUWjPQIpK9tby157MFI4jLt6pTci0pMfZANQmmk6iQTpLNfZCREZD"
+
+VERIFY_TOKEN = "smartprint123"
 HUGGINGFACE_API_KEY = os.getenv('HUGGINGFACE_API_KEY')
 
 # Printer settings
 PRINTER_IP = "192.168.203.10"
 PRINTER_NAME = f"HP_LaserJet_{PRINTER_IP.replace('.', '_')}"
-
-# Initialize Twilio client
-client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 # Create media directory if it doesn't exist
 MEDIA_DIR = Path("media")
@@ -294,44 +290,106 @@ def handle_printer_command(settings, user_number):
     else:
         return "❌ Invalid command. Please try again."
 
-def download_media(media_url, media_type):
-    """Download media from Twilio URL and save to local storage"""
+def send_whatsapp_message(to_number, message, media_urls=None):
+    """Send a WhatsApp message using WhatsApp Business API"""
     try:
-        print(f"\n=== Downloading Media ===")
-        print(f"URL: {media_url}")
-        print(f"Type: {media_type}")
+        url = f"https://graph.facebook.com/v17.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
         
+        headers = {
+            "Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": to_number,
+            "type": "text",
+            "text": {"body": message}
+        }
+        
+        if media_urls:
+            if len(media_urls) == 1:
+                # Single media
+                payload["type"] = "image" if media_urls[0].endswith(('.jpg', '.jpeg', '.png')) else "document"
+                payload["image" if payload["type"] == "image" else "document"] = {
+                    "link": media_urls[0]
+                }
+            else:
+                # Multiple media - send as separate messages
+                for media_url in media_urls:
+                    media_type = "image" if media_url.endswith(('.jpg', '.jpeg', '.png')) else "document"
+                    media_payload = {
+                        "messaging_product": "whatsapp",
+                        "to": to_number,
+                        "type": media_type,
+                        media_type: {"link": media_url}
+                    }
+                    response = requests.post(url, headers=headers, json=media_payload)
+                    if response.status_code != 200:
+                        logger.error(f"Failed to send media message: {response.text}")
+                        return False
+                    time.sleep(1)  # Rate limiting
+                return True
+        
+        response = requests.post(url, headers=headers, json=payload)
+        if response.status_code == 200:
+            logger.info(f"Message sent successfully: {response.json()}")
+            return True
+        else:
+            logger.error(f"Failed to send message: {response.text}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Error sending WhatsApp message: {str(e)}")
+        return False
+
+def download_media(media_id, media_type):
+    """Download media from WhatsApp Business API"""
+    try:
+        logger.info(f"\n=== Downloading Media ===")
+        logger.info(f"Media ID: {media_id}")
+        logger.info(f"Type: {media_type}")
+        
+        # Get media URL
+        url = f"https://graph.facebook.com/v17.0/{media_id}"
+        headers = {"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}"}
+        response = requests.get(url, headers=headers)
+        
+        if response.status_code != 200:
+            logger.error(f"Failed to get media URL: {response.text}")
+            return None
+            
+        media_url = response.json().get('url')
+        if not media_url:
+            logger.error("No media URL in response")
+            return None
+            
+        # Download the file
+        response = requests.get(media_url, headers=headers, stream=True)
+        if response.status_code != 200:
+            logger.error(f"Failed to download media: {response.text}")
+            return None
+            
         # Create a temporary file
         temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=f".{media_type.split('/')[-1]}")
         temp_path = temp_file.name
         
-        # Download the file with Twilio authentication
-        response = requests.get(
-            media_url,
-            stream=True,
-            auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-        )
+        with open(temp_path, 'wb') as f:
+            response.raw.decode_content = True
+            shutil.copyfileobj(response.raw, f)
         
-        if response.status_code == 200:
-            with open(temp_path, 'wb') as f:
-                response.raw.decode_content = True
-                shutil.copyfileobj(response.raw, f)
-            
-            # Generate a unique filename
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"{timestamp}_{Path(temp_path).name}"
-            final_path = MEDIA_DIR / filename
-            
-            # Move to media directory
-            shutil.move(temp_path, final_path)
-            print(f"Media saved to: {final_path}")
-            return str(final_path)
-        else:
-            print(f"Failed to download media. Status code: {response.status_code}")
-            print(f"Response content: {response.text}")
-            return None
+        # Generate a unique filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"{timestamp}_{Path(temp_path).name}"
+        final_path = MEDIA_DIR / filename
+        
+        # Move to media directory
+        shutil.move(temp_path, final_path)
+        logger.info(f"Media saved to: {final_path}")
+        return str(final_path)
+        
     except Exception as e:
-        print(f"Error downloading media: {e}")
+        logger.error(f"Error downloading media: {e}")
         return None
 
 def mock_print_document(file_path, settings):
@@ -353,210 +411,209 @@ def mock_print_document(file_path, settings):
 def mock_scan_document(file_path):
     """Mock function to simulate scanning a document"""
     try:
-        print(f"\n=== Mock Scanning Document ===")
-        print(f"File: {file_path}")
+        logger.info(f"\n=== Mock Scanning Document ===")
+        logger.info(f"File: {file_path}")
         
         # Simulate scanning delay
-        import time
         time.sleep(2)
         
-        # Return a mock scanned file path
+        # Create a copy of the original file as the "scanned" version
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        scanned_path = MEDIA_DIR / f"scanned_{timestamp}.pdf"
+        scanned_filename = f"scanned_{timestamp}.pdf"
+        scanned_path = MEDIA_DIR / scanned_filename
+        
+        # Copy the file to the media directory
+        shutil.copy2(file_path, scanned_path)
+        logger.info(f"Scanned file saved to: {scanned_path}")
+        
         return str(scanned_path)
     except Exception as e:
-        print(f"Error in mock scanning: {e}")
+        logger.error(f"Error in mock scanning: {e}")
         return None
 
-def handle_media_message(request_values):
-    """Handle incoming media messages"""
+def handle_media_message(request_data):
+    """Handle incoming media messages with robust command/media logic"""
     try:
         logger.info("=== Processing Media Message ===")
         
-        # Get media information
-        media_url = request_values.get('MediaUrl0')
-        media_type = request_values.get('MediaContentType0')
-        num_media = int(request.values.get('NumMedia', 0))
+        # Get message data
+        message = request_data.get('entry', [{}])[0].get('changes', [{}])[0].get('value', {})
+        contacts = message.get('contacts', [{}])[0]
+        messages = message.get('messages', [{}])[0]
         
-        if not media_url or not media_type or num_media == 0:
-            logger.warning("No media found in message")
-            return None, "No media found in the message. Please send a document or image."
+        from_number = contacts.get('wa_id')
+        message_type = messages.get('type')
+        message_id = messages.get('id')
+        user_command = messages.get('text', {}).get('body', '').strip().lower()
         
-        logger.info(f"Media Type: {media_type}")
-        logger.info(f"Media URL: {media_url}")
+        logger.info(f"From number: {from_number}")
+        logger.info(f"Message type: {message_type}")
+        logger.info(f"User command: {user_command}")
         
-        # Download the media
-        file_path = download_media(media_url, media_type)
-        if not file_path:
-            return None, "Failed to download the media. Please try again."
-        
-        # Get the last command from the user
-        last_command = request_values.get('Body', '').lower()
-        settings = analyze_command_with_huggingface(last_command) if last_command else None
-        
-        if not settings:
-            settings = {
-                "action": "print",
-                "color_mode": False,
-                "copies": 1,
-                "paper_size": "A4",
-                "orientation": "portrait"
-            }
-        
-        # Create response
-        resp = MessagingResponse()
-        
-        # Process based on command
-        if settings["action"] == "print":
-            success, message = print_document(file_path, settings)
-            if success:
-                # Add the downloaded media to the response
-                media_url = f"https://{request.host}/media/{Path(file_path).name}"
-                resp.message(f"✅ {message}").media(media_url)
-                return True, resp
+        # Handle text-only messages
+        if message_type == 'text':
+            if user_command == 'hi':
+                welcome_message = "👋 Hi! I'm your Printer Bot. Here are the commands you can use:\n\n" + \
+                                "• 'print [in color/black & white]' - Print a document\n" + \
+                                "• 'scan' - Scan a document\n" + \
+                                "• 'make X copies' - Make X copies of a document\n" + \
+                                "• 'status' - Check printer status\n\n" + \
+                                "Just type any of these commands and I'll help you!"
+                send_whatsapp_message(from_number, welcome_message)
+                return True
             else:
-                return False, f"❌ {message}"
+                send_whatsapp_message(from_number, "Please send a document or image along with your command.")
+                return True
         
-        elif settings["action"] == "scan":
-            scanned_path = mock_scan_document(file_path)
-            if scanned_path:
-                # Add the scanned media to the response
-                media_url = f"https://{request.host}/media/{Path(scanned_path).name}"
-                resp.message(f"✅ Document scanned successfully! Saved as: {Path(scanned_path).name}").media(media_url)
-                return True, resp
+        # Handle media messages
+        if message_type in ['image', 'document']:
+            media_id = messages.get('image', {}).get('id') or messages.get('document', {}).get('id')
+            media_type = messages.get('image', {}).get('mime_type') or messages.get('document', {}).get('mime_type')
+            
+            if not media_id or not media_type:
+                logger.warning("Media information missing")
+                send_whatsapp_message(from_number, "Media information missing. Please resend your document or image.")
+                return True
+            
+            file_path = download_media(media_id, media_type)
+            if not file_path:
+                send_whatsapp_message(from_number, "Failed to download the media. Please try again.")
+                return True
+            
+            # Analyze the command
+            settings = analyze_command_with_huggingface(user_command) if user_command else None
+            if not settings:
+                logger.info("Command not recognized. Defaulting to print settings.")
+                settings = {
+                    "action": "print",
+                    "color_mode": False,
+                    "copies": 1,
+                    "paper_size": "A4",
+                    "orientation": "portrait"
+                }
+            
+            logger.info(f"Parsed settings: {settings}")
+            
+            # Process based on command
+            if settings["action"] == "print":
+                success, message = print_document(file_path, settings)
+                if success:
+                    send_whatsapp_message(from_number, f"✅ {message}")
+                else:
+                    send_whatsapp_message(from_number, f"❌ {message}")
+                return True
+            
+            elif settings["action"] == "scan":
+                scanned_path = mock_scan_document(file_path)
+                if scanned_path:
+                    # Get public URLs for both files
+                    original_url = f"https://{request.host}/media/{Path(file_path).name}"
+                    scanned_url = f"https://{request.host}/media/{Path(scanned_path).name}"
+                    
+                    logger.info(f"Original file URL: {original_url}")
+                    logger.info(f"Scanned file URL: {scanned_url}")
+                    
+                    # Send success message
+                    send_whatsapp_message(from_number, "✅ Document scanned successfully! Here are your files:")
+                    # Send both files
+                    send_whatsapp_message(from_number, "", [original_url, scanned_url])
+                    return True
+                else:
+                    send_whatsapp_message(from_number, "❌ Failed to scan document. Please try again.")
+                    return True
+            
             else:
-                return False, "❌ Failed to scan document. Please try again."
-        
-        else:
-            return False, "❌ Invalid command for media. Please specify 'print' or 'scan'."
+                send_whatsapp_message(from_number, "❌ Invalid or unsupported command for media. Please specify 'print' or 'scan'.")
+                return True
+                
+        return True
             
     except Exception as e:
         error_msg = f"Error handling media message: {e}"
         logger.error(error_msg)
-        return False, f"❌ An error occurred while processing the media: {str(e)}"
+        send_whatsapp_message(from_number, f"❌ An error occurred while processing the media: {str(e)}")
+        return True
 
 @app.route('/')
 def home():
     """Root route to confirm server is running"""
     return "Printer Bot is running! Use /webhook for WhatsApp messages."
 
+@app.route('/webhook', methods=['GET', 'POST'])
+def webhook():
+    """Handle incoming WhatsApp messages"""
+    try:
+        # Handle webhook verification
+        if request.method == 'GET':
+            mode = request.args.get('hub.mode')
+            token = request.args.get('hub.verify_token')
+            challenge = request.args.get('hub.challenge')
+            
+            logger.info(f"Webhook verification request - Mode: {mode}, Token: {token}")
+            
+            if mode == 'subscribe' and token == VERIFY_TOKEN:
+                logger.info("Webhook verification successful")
+                return challenge
+            logger.warning("Webhook verification failed")
+            return 'Forbidden', 403
+            
+        # Handle incoming messages
+        logger.info("\n=== Incoming Webhook Request ===")
+        logger.info(f"Request data: {request.json}")
+        
+        body = request.json
+        if (body and 
+            body.get('entry') and 
+            isinstance(body['entry'], list) and 
+            len(body['entry']) > 0 and 
+            body['entry'][0].get('changes') and 
+            isinstance(body['entry'][0]['changes'], list) and 
+            len(body['entry'][0]['changes']) > 0 and 
+            body['entry'][0]['changes'][0].get('value') and 
+            body['entry'][0]['changes'][0]['value'].get('messages') and 
+            isinstance(body['entry'][0]['changes'][0]['value']['messages'], list) and 
+            len(body['entry'][0]['changes'][0]['value']['messages']) > 0):
+            
+            message = body['entry'][0]['changes'][0]['value']['messages'][0]
+            from_number = message.get('from')
+            msg_body = message.get('text', {}).get('body', '').lower() if message.get('text') else ""
+            
+            logger.info(f"Received message from {from_number}: {msg_body}")
+            
+            # Process the message
+            response = handle_media_message(body)
+            return {'status': 'success' if response else 'error'}
+        else:
+            logger.info("No message found in webhook payload")
+            return {'status': 'success'}
+            
+    except Exception as e:
+        logger.error(f"Critical error in webhook: {e}")
+        logger.error(f"Error Type: {type(e).__name__}")
+        logger.error(f"Error Message: {str(e)}")
+        logger.error(f"Request Data: {request.json}")
+        return {'status': 'error', 'message': str(e)}
+
 @app.route('/media/<filename>')
 def serve_media(filename):
     """Serve media files from the media directory"""
     try:
+        logger.info(f"Serving media file: {filename}")
+        logger.info(f"Media directory: {MEDIA_DIR}")
+        logger.info(f"Full path: {MEDIA_DIR / filename}")
+        
+        if not (MEDIA_DIR / filename).exists():
+            logger.error(f"File not found: {MEDIA_DIR / filename}")
+            return "File not found", 404
+            
         return send_from_directory(MEDIA_DIR, filename)
     except Exception as e:
-        print(f"Error serving media file {filename}: {e}")
+        logger.error(f"Error serving media file {filename}: {e}")
         return "File not found", 404
 
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    """Handle incoming WhatsApp messages"""
-    try:
-        # Log incoming request
-        print("\n=== Incoming Webhook Request ===")
-        print(f"From: {request.values.get('From', 'Unknown')}")
-        print(f"To: {request.values.get('To', 'Unknown')}")
-        print(f"Message SID: {request.values.get('MessageSid', 'Unknown')}")
-        
-        # Check if message contains media
-        num_media = int(request.values.get('NumMedia', 0))
-        if num_media > 0:
-            success, response = handle_media_message(request.values)
-            if isinstance(response, str):
-                resp = MessagingResponse()
-                resp.message(response)
-                return str(resp)
-            return str(response)
-        
-        incoming_msg = request.values.get('Body', '').lower()
-        print(f"Message Body: {incoming_msg}")
-        
-        # Handle initial greeting
-        if incoming_msg == 'hi':
-            welcome_message = "👋 Hi! I'm your Printer Bot. Here are the commands you can use:\n\n" + \
-                            "• 'print [in color/black & white]' - Print a document\n" + \
-                            "• 'scan' - Scan a document\n" + \
-                            "• 'make X copies' - Make X copies of a document\n" + \
-                            "• 'status' - Check printer status\n\n" + \
-                            "Just type any of these commands and I'll help you!"
-            print("\n=== Sending Welcome Message ===")
-            print(f"Message: {welcome_message}")
-            
-            resp = MessagingResponse()
-            resp.message(welcome_message)
-            return str(resp)
-            
-        settings = analyze_command_with_huggingface(incoming_msg)
-        if settings:
-            print("\n=== Command Analysis Results ===")
-            print(f"Settings: {json.dumps(settings, indent=2)}")
-            
-            response_msg = f"✅ I'll help you with that!\n\n" + \
-                         f"Action: {settings['action']}\n" + \
-                         f"Color Mode: {'Color' if settings['color_mode'] else 'Black & White'}\n" + \
-                         f"Copies: {settings['copies']}\n" + \
-                         f"Paper Size: {settings['paper_size']}\n" + \
-                         f"Orientation: {settings['orientation']}\n\n" + \
-                         f"Please scan the QR code to connect to the printer."
-            
-            print("\n=== Generating QR Code ===")
-            qr = qrcode.QRCode(version=1, box_size=10, border=5)
-            qr.add_data("https://printer-connect.example.com")
-            qr.make(fit=True)
-            qr_img = qr.make_image(fill_color="black", back_color="white")
-            qr_path = "printer_qr.png"
-            qr_img.save(qr_path)
-            print(f"QR Code saved to: {qr_path}")
-            
-            print("\n=== Sending Twilio Message ===")
-            try:
-                message = client.messages.create(
-                    from_=f'whatsapp:{os.getenv("TWILIO_PHONE_NUMBER")}',
-                    body=response_msg,
-                    to=request.values.get('From', ''),
-                    media_url=[f"https://{request.host}/static/{qr_path}"]
-                )
-                print(f"Message SID: {message.sid}")
-                print(f"Message Status: {message.status}")
-                
-                resp = MessagingResponse()
-                resp.message(response_msg)
-                return str(resp)
-            except Exception as twilio_error:
-                print(f"\n=== Twilio Error ===")
-                print(f"Error Type: {type(twilio_error).__name__}")
-                print(f"Error Message: {str(twilio_error)}")
-                error_msg = "Sorry, there was an error sending the message. Please try again later."
-                resp = MessagingResponse()
-                resp.message(error_msg)
-                return str(resp)
-        else:
-            print("\n=== Command Not Understood ===")
-            print(f"Original message: {incoming_msg}")
-            resp = MessagingResponse()
-            resp.message("I'm not sure I understand. Try saying something like 'make 3 copies' or 'print in color'")
-            return str(resp)
-    except Exception as e:
-        print(f"\n=== Critical Error in Webhook ===")
-        print(f"Error Type: {type(e).__name__}")
-        print(f"Error Message: {str(e)}")
-        print(f"Request Values: {dict(request.values)}")
-        resp = MessagingResponse()
-        resp.message("Sorry, something went wrong. Please try again.")
-        return str(resp)
-
-@app.route('/send-initial', methods=['POST'])
-def send_initial_message():
-    user_number = request.json.get('phone_number')
-    if not user_number:
-        return {'error': 'Phone number required'}, 400
-    message = "Hi! I'm your Printer Bot. Send 'hi' to see available options."
-    success = send_whatsapp_message(user_number, message)
-    if success:
-        return {'status': 'Message sent successfully'}
-    else:
-        return {'error': 'Failed to send message'}, 500
-
 if __name__ == '__main__':
-    app.run(debug=True, port=5001) 
+    try:
+        logger.info("Starting Printer Bot server...")
+        app.run(host='0.0.0.0', debug=True, port=5001)
+    except Exception as e:
+        logger.error(f"Failed to start server: {e}")
